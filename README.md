@@ -1,0 +1,1 @@
+# ij bash environment

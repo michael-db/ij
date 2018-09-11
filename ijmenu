@@ -1,0 +1,304 @@
+#!/usr/bin/env perl
+
+=head1 NAME
+
+ijmenu - minimalist scrollable menu for shell scripts
+
+=cut
+
+# For documentation, skip to __END__
+use strict;
+use warnings;
+use POSIX;
+use Pod::Usage;
+my $version = "1.1";
+
+if (@ARGV and $ARGV[0] eq '-v' || $ARGV[0] eq '--version') {
+    print "ijmenu $version\n";
+    exit 0;
+}
+my $numeric = 0;
+if (@ARGV and $ARGV[0] eq '-n') { $numeric = 1; shift; }
+defined($_ = shift) and /^-?\d+$/
+    or pod2usage("Three integer arguments expected.")
+    for my ($cursor, $pagesize, $pagestart);
+my @items = @ARGV or pod2usage("No menu items specified.");
+$_ < 0 and $_ += @items for ($cursor, $pagestart);
+$pagesize or limit(5, \($pagesize = ceil sqrt @items));
+$pagesize > 0 or pod2usage("Pagesize cannot be negative.");
+# (for arguments to tput, see, e.g., man 5 terminfo)
+chomp (my $lines = `tput lines`);
+$? and die "Problems executing 'tput' (ncurses)";
+$lines or die "Terminal problems";
+limit(1, \$pagesize, $lines);
+limit(1, \$pagesize, 0 + @items);
+limit(0, \$cursor, $#items);
+limit(0, \$pagestart, @items - $pagesize);
+limit($cursor - $pagesize + 1, \$pagestart, $cursor);
+my $help = 0;
+my @helptext = (
+    " i/j = Up/Down  I/J = PgUp/PgDn  k = i ",
+    " a|h = Home  z|l = End  q = Esc  Enter ",
+    "           [ press any key ]           ");
+if ($pagesize < 2) { $helptext[0] .= $helptext[1]; }
+my %cmds = ("i" => \&up, "j" => \&down,
+    "I" => \&pageup, "J" => \&pagedown,
+    "k" => \&up, "K" => \&pageup,
+    "a" => \&home, "h" => \&home, "l" => \&end, "z" => \&end,
+    "q" => \&finish, "\033" => \&finish,
+    "\n" => \&choose, " " => \&choose,
+    "\033[A" => \&up, "\033[B" => \&down,
+    "\033[5~" => \&pageup, "\033[6~" => \&pagedown,
+    # Home and End keys vary considerably ...
+    "\033[7~" => \&home, "\033[8~" => \&end,
+    "\033[1~" => \&home, "\033[4~" => \&end,
+    "\033OH" => \&home, "\033OF" => \&end,
+    "\033[H" => \&home, "\033[F" => \&end);
+# swap stdout and stderr
+open($_, ">&", STDOUT) and open(STDOUT, ">&", STDERR)
+    and open(STDERR, ">&", $_);
+$| = 1;     # autoflush output
+setup_term();
+$SIG{'INT' } = $SIG{'QUIT'} = $SIG{'HUP' } = $SIG{'TRAP'} =
+    $SIG{'ABRT'} = $SIG{'STOP'} = $SIG{'USR1'} = $SIG{'USR2'} =
+    sub { restore_term(); exit(1); };
+my $maxchars = 0;
+for (keys %cmds) { limit(length, \$maxchars); }
+for (;;) {
+    refresh();
+    sysread(STDIN, my $key, $maxchars) or finish();
+    my $cmd;
+    $cmd = $cmds{$key} || $cmds{lc $key} unless $help;
+    if ($cmd) { &$cmd(); } else { $help = !$help; }
+}
+
+sub limit {
+    defined $_[0] and ${$_[1]} < $_[0] and ${$_[1]} = $_[0];
+    defined $_[2] and ${$_[1]} > $_[2] and ${$_[1]} = $_[2];
+}
+sub up {
+    unless ($cursor) { flash(); return; }
+    --$cursor < $pagestart and --$pagestart;
+}
+sub down {
+    unless ($cursor < $#items) { flash(); return; }
+    ++$cursor >= $pagestart + $pagesize and ++$pagestart;
+}
+sub pageup {
+    unless ($cursor) { flash(); return; }
+    limit(0, \($pagestart -= $pagesize));
+    limit(0, \($cursor -= $pagesize));
+}
+sub pagedown {
+    unless ($cursor < $#items) { flash(); return; }
+    limit(0, \($pagestart += $pagesize), @items - $pagesize);
+    limit(0, \($cursor += $pagesize), $#items);
+}
+sub home { flash() unless $cursor; $cursor = $pagestart = 0; }
+sub end {
+    flash() unless $cursor < $#items;
+    $cursor = $#items;
+    $pagestart = @items - $pagesize;
+}
+sub choose { finish($items[$cursor]); }
+sub finish {
+    my $choice = shift;
+    $_ = '' foreach (@items);
+    refresh();
+    restore_term();
+    if ($numeric) { print STDERR "$cursor $pagesize $pagestart" }
+    elsif (defined $choice) { print STDERR "$choice"; }
+    exit(defined $choice ? 0 : 66);
+}
+sub refresh {
+    chomp (my $cols = `tput cols`);
+    system("tput cud1") for (2 .. $pagesize);
+    for (my $i = $pagestart + $pagesize - 1;
+        $i >= $pagestart; --$i)
+    {
+        system("tput el");
+        if ($i == $cursor || $help) { system("tput smso"); }
+        my $item = $help ?
+            $helptext[$i - $pagestart] || '' : $items[$i];
+        if (($_ = length($item)) > $cols) {
+            substr($item, int($cols/2) - 2, 4 + $_ - $cols)
+                = " .. ";
+        }
+        print "$item\r";
+        if ($i == $cursor || $help) { system("tput rmso"); }
+        system("tput cuu1") if $i > $pagestart;
+    }
+}
+sub flash { system("tput flash"); }
+my ($term, $lflag);
+sub setup_term {
+    $term = POSIX::Termios->new();
+    $term->getattr(fileno(STDIN));
+    $lflag = $term->getlflag();
+    $term->setlflag($lflag & ~(ECHO | ECHOK | ICANON));
+    $term->setattr(fileno(STDIN), TCSANOW);
+    system("tput civis");
+}
+sub restore_term {
+    $term->setlflag($lflag);
+    $term->setattr(fileno(STDIN), TCSANOW);
+    system("tput cnorm");
+}
+__END__
+
+=head1 SYNOPSIS
+
+ ijmenu CURSOR PAGE_SIZE PAGE_TOP ITEM [ITEM ...]
+ ijmenu -n CURSOR PAGE_SIZE PAGE_TOP ITEM [ITEM ...]
+ ijmenu -v
+
+ # Examples
+
+ ijmenu 0 0 0 zero one two three four five six seven
+ # initially displayed items and [cursor]:
+ # [zero], one, two, three, four
+
+ ijmenu 6 3 5 zero one two three four five six seven
+ # five, [six], seven
+
+ ijmenu -2 3 -3 zero one two three four five six seven
+ # the same: args #1 and #3 wrap once if < 0
+
+ # it is best to check the exit code, e.g. (bash):
+ choice=$( ijmenu 0 0 0 "(1) uno" "(2) due" "(3) tre" )
+ if [ "$?" -ne 0 ]; then choice=; fi
+
+ # multiple selection, implemented using numeric mode (-n)
+ unset fruit
+ for x in apple cherry grape lime mango orange plum; do
+     fruit[${#fruit[@]}]="  $x";
+ done
+ nums="0 0 0"
+ echo "Press Enter to select/unselect items, Q to finish."
+ while nums=`ijmenu -n $nums "${fruit[@]}"`; do
+     n=${nums%% *}
+     fruit[$n]=`echo "${fruit[$n]}"|sed 's/^\*/ /;t;s/^ /*/'`
+ done
+ echo "You chose these items:"
+ for o in "${fruit[@]}"; do echo "$o"|sed -n 's/^\* //p'; done
+
+=head1 ARGUMENTS
+
+=over
+
+=item 1
+
+The initial cursor position, 0 for the first menu item.
+A negative number counts from the end, starting with -1
+for the last item.
+A number outside the range [-(num items) .. (num items)-1]
+will be changed to the first (if negative) or last item.
+
+=item 2
+
+The scrollable page size, that is, the number of menu
+items visible at any time.
+Automatically reduced for a smaller screen or fewer items.
+Specify 0 and ijmenu will choose a page size for you
+(see L</Automatic page sizing> below).
+
+=item 3
+
+The first visible item in the initially displayed page,
+numbered in the same way as the first argument.
+This will be adjusted if out of range or if necessary
+to ensure the cursor is positioned at a visible item.
+
+=back
+
+The fourth and subsequent arguments are the menu items.
+These should not contain newlines, tabs, or other special
+characters.
+
+=head1 DESCRIPTION
+
+ijmenu displays a scrollable menu in an xterm or similar
+terminal emulator.
+Compared to alternatives like whiptail,
+it takes a simple, minimalist approach: by default, it
+uses only a few lines of the screen, and it does not
+display a scroll bar (for an indicator of relative list
+position, numbering the menu items is an effective
+alternative to a scroll bar).
+
+All navigation functions are accessible by alphabetic
+keys in addition to the usual cursor movement keys,
+and the item at the cursor is selected by pressing
+either Enter or the space bar:
+
+ i/j = Up/Down  I/J = PgUp/PgDn  k = i
+ a|h = Home  z|l = End  q = Esc  Enter
+
+The scrolling menu is displayed via standard error.
+
+Normally, the text of the selected item is written to
+standard output.
+If nothing is selected, there is no output (though
+in the event of an error this is not guaranteed, so
+it is best to check the exit code).
+
+However, in numeric mode, enabled with the '-n' option,
+ijmenu instead outputs its last state, that is, the new
+values corresponding to the three numbers passed to it:
+the index of the cursor, the page size, and the index
+of the first visible item.
+In numeric mode, it does this even if the user presses
+Esc instead of Enter, so the exit code must be checked.
+
+Exit code: this is 0 if a selection is made or if the
+version number is output ('-v' option).
+If the user presses Q or Esc to quit without selecting
+an item then the exit code is 66.
+In the event of an error, the exit code is non-zero.
+
+=head2 Automatic page sizing
+
+If you specify 0 for the page size then ijmenu will
+choose an optimal page size for you.
+For shorter lists, the scrollable window shows 5 items.
+For longer lists, this number increases to roughly the
+square root of the list length:
+to a good approximation, this minimizes the average
+number of key presses needed to move the cursor to a
+given item (you might want to think about why this is so);
+it also means that the number of visible items can
+provide an indication of the overall list length -
+and over a greater range than a linear scale.
+
+=head1 HISTORY
+
+Revision 1.1 added the '-n' option, allowed the use of
+the space bar to select an item, and changed the exit
+codes (ijmenu 1.0 was publicly available only briefly,
+so invoking code should not need to allow for this).
+
+=head1 BUGS
+
+The program assumes escape sequences as used by different
+flavours of xterm, rxvt, and related vt100-type terminal
+emulators.
+No particular effort is made at universal compatibility.
+
+The help text which appears when an unrecognized key is
+pressed may also appear if keys are pressed faster than
+they can be processed.
+
+=head1 COPYRIGHT AND LICENCE
+
+Copyright 2011 Michael Breen.
+This is free software WITHOUT ANY WARRANTY; without even
+the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.
+Licensed under the GNU General Public License version 3
+(see http://www.gnu.org/licenses/).
+
+=head1 SEE ALSO
+
+dialog(1), whiptail(1).
+
+Updates: http://mbreen.com/ij.html
